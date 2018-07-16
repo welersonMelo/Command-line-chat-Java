@@ -1,5 +1,7 @@
 package br.ufs.dcomp.chat;
 
+import br.ufs.dcomp.chat.*;
+
 import java.util.Date;
 import java.text.SimpleDateFormat;
 import java.util.Calendar;
@@ -8,6 +10,11 @@ import java.lang.*;
 import com.rabbitmq.client.*;
 import java.util.Scanner;
 import java.io.IOException;
+
+import java.nio.file.*;
+import java.io.*;
+
+import com.google.protobuf.ByteString; 
 
 public class App {
     
@@ -21,6 +28,14 @@ public class App {
           System.err.println("Nome do grupo invalido tente novamente!");
       }
       return groupName;
+  }
+  
+  public static String getFileName(String path){
+      int i = path.length() - 1;
+      while(i > 0 && path.charAt(i) != '/')
+          i--;
+      
+      return path.substring(i+1, path.length());
   }
   
   public static String[] getUserGroup(String toSend, int endPosiCommand){
@@ -59,7 +74,8 @@ public class App {
     ConnectionFactory factory = new ConnectionFactory();
     factory.setUri("amqp://cyymdjjz:5APCLwN2DgBf2-I96_6Fw-fQ-qY_uTXm@emu.rmq.cloudamqp.com/cyymdjjz");
     Connection connection = factory.newConnection();
-    Channel channel = connection.createChannel();
+    Channel channelFile = connection.createChannel();
+    Channel channelText = connection.createChannel();
     
     //Inicializando chat, login
     Scanner sc = new Scanner(System.in); 
@@ -69,24 +85,77 @@ public class App {
     System.out.println();
     
                       //(queue-name, durable, exclusive, auto-delete, params); 
-    channel.queueDeclare(user, false,   false,     false,       null);
+    channel.queueDeclare(user+"-text", false,   false,     false,       null);
+    channel2.queueDeclare(user+"-file", false,   false,     false,       null);
     
+    // Replicar queue, uma para arquivo e outra para mensagem normal
+    // Usar o rooting key do Rmq para rotear arquivos enviados para exchanges(grupos)
+
+    //----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+    //Preparando para receber mensagem -------------------------------------------------------------------------------------------------------------------------------------------------
+    //----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
     Consumer consumer = new DefaultConsumer(channel) {
       public void handleDelivery(String consumerTag, Envelope envelope, AMQP.BasicProperties properties, byte[] body)           throws IOException {
-        //Mensagem recebida de algum dos usuários
-        String message = new String(body, "UTF-8");
-        System.out.print("\n" + message + pretext);
+        //Mensagem recebida de algum dos usuário
+        MensagemProto.Mensagem message = MensagemProto.Mensagem.parseFrom(body);        
+        String emissor = message.getEmissor();
+        String data = message.getData();
+        String hora = message.getHora();
+        String grupo = message.getGrupo();
+        MensagemProto.Conteudo messageContent = message.getConteudo();
+        
+        //Se for uma mensagem de console
+        if(messageContent.getTipo().equals("text/plain")){
+            String header = "";
+            if(grupo == ""){
+                header = "("+ data + " às " + hora + ") @" + emissor + " diz: ";
+            }else{
+                header = "("+ data + " às " + hora + ") " + emissor + "#" + grupo +" diz: ";
+            }
+                
+            String finalMessage = new String(messageContent.getCorpo().toByteArray(), "UTF-8");
+            System.out.print("\n" + header + finalMessage);
+        }//Caso seja um arquivo
+        else{
+            Scanner sci = new Scanner(System.in); 
+            System.out.println("\n@" + emissor + " te enviou um arquivo. Deseja baixar? (Y/N)");
+            String ans = sci.nextLine().trim();
+            
+            if(!(ans.equals("N") || ans.equals("n"))){
+                String header = "("+ data + " às " + hora + ") Arquivo '" + messageContent.getNome() + "' recebido de @"+ emissor;
+                System.out.print("\n" + header);
+                
+                byte[] fileReceived;
+                fileReceived = messageContent.getCorpo().toByteArray();
+                OutputStream os = new FileOutputStream("chat-file@"+emissor+"-"+messageContent.getNome());
+                os.write(fileReceived);
+                os.close();
+            }
+        }
+        
+        System.out.print("\n"+pretext+">>");
       }
     };
+    //----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+    //------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
     
+    
+                       
                          //(queue-name, autoAck, consumer);    
-    channel.basicConsume( user , true,    consumer);
+    channel.basicConsume( user+"-text", true,   consumer);
+    channel2.basicConsume( user+"-file", true,   consumer);
     
     String toSend, receiver = "", messageToSend = "", command = "", groupName = "", friendName = "";
     
     boolean readyToSend = false;
+    FileInputStream file = null;
+    File in = null;
+    
     while(true){
-        pretext = "\n";
+        String filePath = "";
+        boolean isMessageText = true;
+        
+        pretext = "";
         if(receiver.length() > 0){
             pretext += "@";
             readyToSend = true;
@@ -95,8 +164,8 @@ public class App {
             readyToSend = true;
         }
             
-        pretext += receiver+groupName+">>";
-        System.out.print(pretext);
+        pretext += receiver+groupName;
+        System.out.print("\n"+pretext+">>");
         
         toSend = sc.nextLine();
         
@@ -173,26 +242,76 @@ public class App {
                         System.err.println("Erro ao tentar excluir grupo");
                     };
                     groupName = "";
+                }else if(command.equals("upload")){
+                    isMessageText = false;
+                    filePath = toSend.substring(endPosiCommand, toSend.length()).trim();
+                    in = new File(filePath);
+	                file = null;
+                    try { 
+                        file = new FileInputStream(in); 
+                        System.out.println("Uploading file " + filePath + " to " + pretext + "...");
+                        readyToSend = true;  
+                        break;
+                    }catch(Exception e){
+                        System.out.println("Erro ao tentar enviar aquivo. Arquivo não encontrado!");
+                        readyToSend = false;  
+                    }
                 }else{
                     System.out.print("Comando não encontrado!");
                 }
-                
                 readyToSend = false;    
                 break;
             }
         }
         if(readyToSend){
-            String toGroup = "";
-            if(groupName.length() != 0){
-                toGroup = "#";
+             MensagemProto.Conteudo.Builder conteudoMen = MensagemProto.Conteudo.newBuilder();
+            
+            //Verificando tipo da mensagem
+            if(isMessageText){
+                //Se for texto no console
+                ByteString bs = ByteString.copyFrom(toSend.getBytes());
+                conteudoMen.setTipo("text/plain");
+                conteudoMen.setCorpo(bs);
+                conteudoMen.setNome("");
+            }else{
+                byte fileContent[] = new byte[(int)in.length()];
+                file.read(fileContent);
+                
+                Path source = Paths.get(filePath);
+                String tipoMime = Files.probeContentType(source);
+                
+                ByteString bs = ByteString.copyFrom(fileContent);
+                conteudoMen.setTipo(tipoMime);
+                conteudoMen.setCorpo(bs);
+                conteudoMen.setNome(getFileName(filePath));
+                
+                file.close();
             }
             
-            String timeStamp = new SimpleDateFormat("(dd/MM/yyyy 'às' HH:mm)").format(Calendar.getInstance().getTime());
+            MensagemProto.Conteudo conteudoPronto = conteudoMen.build();
             
-            messageToSend = timeStamp  + " " + user + toGroup + groupName + " diz: " + toSend;  
-            
-            //System.out.println(messageToSend);    
-            channel.basicPublish(groupName, receiver , null,  messageToSend.getBytes("UTF-8"));
+            //Preparando para serializar mensagem
+            MensagemProto.Mensagem.Builder message = MensagemProto.Mensagem.newBuilder();
+            message.setEmissor(user);
+            message.setData(new SimpleDateFormat("dd/MM/yyyy").format(Calendar.getInstance().getTime()));
+            message.setHora(new SimpleDateFormat("HH:mm").format(Calendar.getInstance().getTime()));
+            message.setGrupo(groupName);
+            message.setConteudo(conteudoPronto);
+        
+            //messageToSend 
+            MensagemProto.Mensagem mensagemPronta = message.build();
+        
+            //Serializando 
+            byte[] buffer = mensagemPronta.toByteArray(); 
+           
+            if(isMessageText){
+                 //Evinando para a fila de texto do RMQ
+                channel.basicPublish(groupName, receiver+"-text" , null, buffer);
+            }else{
+                //Evinando para a fila de arquivo do RMQ
+                channel2.basicPublish("", receiver+"-file" , null, buffer);
+            }
+           
         }
     }
   }
